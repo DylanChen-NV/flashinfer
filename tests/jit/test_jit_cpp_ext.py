@@ -214,6 +214,18 @@ def test_jit_spec_aot_cache_hit_does_not_log_jit_build(
     assert logs == []
 
 
+def test_jit_spec_force_jit_ignores_aot_cache(monkeypatch, tmp_path, jit_spec_nvcc):
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_AOT_DIR", tmp_path)
+    monkeypatch.setenv("FLASHINFER_FORCE_JIT", "1")
+
+    spec = jit_spec_nvcc
+    spec.aot_path.parent.mkdir(parents=True)
+    spec.aot_path.touch()
+
+    assert not spec.is_aot
+    assert spec.try_load() is None
+
+
 @pytest.mark.parametrize("is_aot", [False, True])
 def test_jit_spec_post_load_adapter_applies_to_jit_and_aot_load_paths(
     monkeypatch, tmp_path, is_aot

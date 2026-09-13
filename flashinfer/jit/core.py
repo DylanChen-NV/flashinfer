@@ -377,7 +377,10 @@ class JitSpecNvcc(JitSpec):
 
     @property
     def is_aot(self) -> bool:
-        return self.aot_path.exists()
+        # Source-development builds may intentionally need to rebuild a module
+        # that is also present in an installed AOT cache.  In that case the AOT
+        # artifact must not win over the modified sources.
+        return not os.environ.get("FLASHINFER_FORCE_JIT") and self.aot_path.exists()
 
     @property
     def is_compiled(self) -> bool:
