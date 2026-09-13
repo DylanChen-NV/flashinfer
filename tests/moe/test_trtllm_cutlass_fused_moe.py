@@ -3253,9 +3253,12 @@ def test_moe_bf16_mxfp4_hopper_activations(
     ids=list(PHASE3_HUMMING_E2E_CASES.keys()),
 )
 @pytest.mark.parametrize("use_autotune", [False, True])
+@pytest.mark.parametrize("input_mode", ["online", "prequantized"])
 def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
-    case_name, case, use_autotune
+    case_name, case, use_autotune, input_mode
 ):
+    if input_mode == "prequantized" and (case_name != "small" or use_autotune):
+        pytest.skip("one small default-tactic case covers prequantized Humming input")
     if use_autotune and case.get("skip_autotune", False):
         pytest.skip(
             "autotune is covered by other Humming cases; "
@@ -3409,16 +3412,29 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
         fc2_residual_expert_scale,
     ]
 
+    x_runtime = x
+    input_sf = None
+    if input_mode == "prequantized":
+        input_amax = x.abs().to(torch.float32).amax(dim=1, keepdim=True)
+        input_quant = torch.where(
+            input_amax > 0,
+            torch.full_like(input_amax, 448.0) / input_amax,
+            torch.ones_like(input_amax),
+        )
+        x_runtime = (x.to(torch.float32) * input_quant).to(torch.float8_e4m3fn)
+        input_sf = (1.0 / input_quant).contiguous()
+
     def run_flash(profile_ids=None):
         flash_output = torch.zeros(m, k, device=device, dtype=output_dtype)
         fused_moe.cutlass_fused_moe(
-            x,
+            x_runtime,
             selected_experts.to(torch.int32),
             routing_weights,
             w1_il,
             w2_il,
             output_dtype,
             quant_scales=quant_scales,
+            input_sf=input_sf,
             use_w4_group_scaling=True,
             use_wfp4afp8_humming=True,
             ep_size=ep_size,
