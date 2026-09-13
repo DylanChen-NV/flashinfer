@@ -2992,6 +2992,20 @@ PHASE3_HUMMING_E2E_CASES = {
         "torch_ref_max_bad": 0,
         "description": "E32-style FC1 N4096/K4096 full-tactic coverage",
     },
+    "k3_profile": {
+        "seed": 31,
+        "e": 1,
+        "m": 8,
+        "n": 3584,
+        "k": 7168,
+        "top_k": 1,
+        "raw_scale": (118, 122),
+        "torch_ref_tolerance": (5e-2, 1e-3),
+        # Large-K BF16 accumulation can produce a few sub-0.002 absolute
+        # outliers while the rest of the 57K-element output remains in tolerance.
+        "torch_ref_max_bad": 4,
+        "description": "Kimi K3 GEMM shapes exercise shape-valid autotune preparation",
+    },
 }
 
 
@@ -3257,8 +3271,8 @@ def test_moe_bf16_mxfp4_hopper_activations(
 def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     case_name, case, use_autotune, input_mode
 ):
-    if input_mode == "prequantized" and (case_name != "small" or use_autotune):
-        pytest.skip("one small default-tactic case covers prequantized Humming input")
+    if input_mode == "prequantized" and case_name not in ("small", "k3_profile"):
+        pytest.skip("focused small and K3-shape cases cover prequantized Humming input")
     if use_autotune and case.get("skip_autotune", False):
         pytest.skip(
             "autotune is covered by other Humming cases; "

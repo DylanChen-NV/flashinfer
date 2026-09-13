@@ -702,10 +702,25 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
             : group_size_;
     int const num_experts = static_cast<int>(fc2_expert_weights.size(0) * ep_size);
 
-    // Get specific profile configs according to the profile_id.
-    // Fallback tactic is set to be 0
-    // TODO: use the best tactic id found offline for a better default inference perf
-    auto profile = profile_id == -1 ? mAllProfiles.front() : mAllProfiles[profile_id];
+    // Get the requested profile. During autotune preparation the Python tuner
+    // passes -1 because it only needs the runner workspace initialized. The
+    // first globally enumerated tactic is not necessarily valid for this GEMM
+    // stage and shape (for example Kimi K3 Humming GEMM1). Pick the first
+    // shape-valid tactic for preparation instead of blindly using tactic 0.
+    int64_t selected_profile_id = profile_id;
+    if (selected_profile_id == -1 && mUseW4GroupScaling) {
+      int64_t const gemm_n =
+          gemm_idx == 1 ? fc1_expert_weights.size(1) : fc2_expert_weights.size(1);
+      int64_t const gemm_k = gemm_idx == 1 ? hidden_size : inter_size;
+      auto const valid_tactics = getValidTacticsForShape(gemm_idx, gemm_n, gemm_k);
+      if (!valid_tactics.empty()) {
+        selected_profile_id = valid_tactics[0];
+      }
+    }
+    // Preserve the legacy tactic-0 fallback if shape filtering is unavailable
+    // or yields no candidates; the caller will report the underlying error.
+    auto profile = selected_profile_id == -1 ? mAllProfiles.front()
+                                             : mAllProfiles[selected_profile_id];
 
     auto stream = get_stream(input.device());
 
