@@ -153,15 +153,24 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     auto make_humming_runner = [&] {
       mInnerDimMultiplier = 2;
       mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0;
-      TVM_FFI_ICHECK(mActivationDtype == dl_float16 || mActivationDtype == dl_bfloat16)
-          << "Humming-style MXFP4 x FP8 requires FP16/BF16 inputs and online FP8 activation "
-             "quantization.";
-      TVM_FFI_ICHECK(mActivationDtype == mOutputDtype)
-          << "Humming-style MXFP4 x FP8 online activation quantization currently requires "
-             "activation dtype and output dtype to match.";
-      mKernelRunner =
-          switch_output_type<__nv_fp8_e4m3, kernels::Fp4Type, true, false,
-                             kernels::Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>(mOutputDtype);
+      bool const online_quant =
+          mActivationDtype == dl_float16 || mActivationDtype == dl_bfloat16;
+      bool const prequantized = mActivationDtype == dl_float8_e4m3fn;
+      TVM_FFI_ICHECK(online_quant || prequantized)
+          << "Humming-style MXFP4 x FP8 requires FP16/BF16 online-quantized input or "
+             "prequantized FP8 E4M3 input.";
+      if (online_quant) {
+        TVM_FFI_ICHECK(mActivationDtype == mOutputDtype)
+            << "Humming-style MXFP4 x FP8 online activation quantization currently requires "
+               "activation dtype and output dtype to match.";
+        mKernelRunner =
+            switch_output_type<__nv_fp8_e4m3, kernels::Fp4Type, true, false,
+                               kernels::Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>(mOutputDtype);
+      } else {
+        mKernelRunner =
+            switch_output_type<__nv_fp8_e4m3, kernels::Fp4Type, false, false,
+                               kernels::Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>(mOutputDtype);
+      }
     };
 
     // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
@@ -551,10 +560,20 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           << "fc1_expert_weights inter size must be equal to fc2_expert_weights inter size.";
     }
 
-    TVM_FFI_ICHECK(!input_sf.has_value() || isMxfp8ActScalingQuant() || isNvfp4Quant())
-        << "Block-scaling factors provided for non block-scaling quantization";
+    TVM_FFI_ICHECK(!input_sf.has_value() || isMxfp8ActScalingQuant() || isNvfp4Quant() ||
+                       isPrequantizedHummingQuant())
+        << "Scale factors provided for a quantization mode that does not consume them";
     TVM_FFI_ICHECK(!isMxfp8ActScalingQuant() || input_sf.has_value())
         << "input_sf must be provided when use_mxfp8_act_scaling=True";
+    TVM_FFI_ICHECK(!isPrequantizedHummingQuant() || input_sf.has_value())
+        << "input_sf must provide one FP32 dequant scale per token for prequantized Humming";
+    if (isPrequantizedHummingQuant()) {
+      CHECK_INPUT_AND_TYPE(input_sf.value(), dl_float32);
+      TVM_FFI_ICHECK_EQ(input_sf.value().ndim(), 2)
+          << "prequantized Humming input_sf must have shape [num_tokens, 1]";
+      TVM_FFI_ICHECK_EQ(input_sf.value().size(0), input.size(0));
+      TVM_FFI_ICHECK_EQ(input_sf.value().size(1), 1);
+    }
 
     int experts_per_token = token_selected_experts.size(1);
     int64_t num_rows = input.size(0);
@@ -1537,9 +1556,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
   bool isWMxfp4AFp8HummingQuant() const {
     bool const supported_activation =
-        mActivationDtype == dl_float16 || mActivationDtype == dl_bfloat16;
+        mActivationDtype == dl_float16 || mActivationDtype == dl_bfloat16 ||
+        mActivationDtype == dl_float8_e4m3fn;
     return mUseWfp4Afp8Humming && mUseW4GroupScaling && supported_activation &&
            mWeightDtype == dl_uint8 && !mUsePackedWeights && !mUseMxfp8ActScaling;
+  }
+
+  bool isPrequantizedHummingQuant() const {
+    return isWMxfp4AFp8HummingQuant() && mActivationDtype == dl_float8_e4m3fn;
   }
 
   bool isWMxfp4AFp8Quant() const {

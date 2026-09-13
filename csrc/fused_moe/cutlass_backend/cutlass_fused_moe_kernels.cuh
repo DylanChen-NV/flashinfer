@@ -1771,6 +1771,19 @@ __global__ void expandInputRowsKernel(
         cutlass::arch::global_store<OutputElem, sizeof(OutputElem)>(
             out_vec, dest_row_ptr + elem_index, true);
       }
+      if constexpr (std::is_same_v<InputActivationsType, __nv_fp8_e4m3> &&
+                    std::is_same_v<ExpandedActivationsType, __nv_fp8_e4m3>) {
+        if (fp8_token_dequant_scale && threadIdx.x == 0) {
+          assert(input_sf != nullptr);
+          float residual = 1.0f;
+          if (fp8_expert_residual_scale) {
+            int const expert = permuted_token_selected_experts[permuted_row];
+            residual = fp8_expert_residual_scale[expert];
+          }
+          auto const* input_per_token_scale = reinterpret_cast<float const*>(input_sf);
+          fp8_token_dequant_scale[permuted_row] = input_per_token_scale[source_row] * residual;
+        }
+      }
     }
 
     if (permuted_scales && threadIdx.x == 0) {
