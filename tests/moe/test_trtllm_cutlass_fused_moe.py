@@ -2996,17 +2996,129 @@ PHASE3_HUMMING_E2E_CASES = {
         "seed": 31,
         "e": 1,
         "m": 8,
+        "n": 3072,
+        "k": 3584,
+        "top_k": 1,
+        "raw_scale": (118, 122),
+        "torch_ref_tolerance": (5e-2, 1e-3),
+        "torch_ref_max_bad": 4,
+        "description": "Kimi K3 hidden-3584/inter-3072 shapes exercise autotune preparation",
+    },
+    "large_k_profile": {
+        "seed": 31,
+        "e": 1,
+        "m": 8,
         "n": 3584,
         "k": 7168,
         "top_k": 1,
         "raw_scale": (118, 122),
         "torch_ref_tolerance": (5e-2, 1e-3),
-        # Large-K BF16 accumulation can produce a few sub-0.002 absolute
-        # outliers while the rest of the 57K-element output remains in tolerance.
+        # Generic large-K regression, not the K3 latent-MoE shape. The
+        # user-approved budget is 8/57344; reference quantization/BF16
+        # semantics must still be aligned before release acceptance.
+        "torch_ref_max_bad": 8,
+        "description": "Generic hidden-7168/inter-3584 large-K regression",
+    },
+    "k3_single_token_profile": {
+        "seed": 37,
+        "e": 1,
+        "m": 15,
+        "n": 3072,
+        "k": 3584,
+        "top_k": 1,
+        "tune_max_num_tokens": 16,
+        "input_sf_storage_offset_bytes": 1536,
+        "raw_scale": (118, 122),
+        "torch_ref_tolerance": (5e-2, 1e-3),
+        "torch_ref_max_bad": 2,
+        "description": "Kimi K3 single-token bucket exercises Humming autotune preparation",
+    },
+    "k3_ep32_single_token_profile": {
+        "seed": 41,
+        "e": 28,
+        "m": 32,
+        "n": 3072,
+        "k": 3584,
+        "top_k": 16,
+        "tune_max_num_tokens": 32,
+        "deepep_sparse_local_ids": True,
+        "raw_scale": (118, 122),
+        "torch_ref_tolerance": (5e-2, 1e-3),
         "torch_ref_max_bad": 4,
-        "description": "Kimi K3 GEMM shapes exercise shape-valid autotune preparation",
+        "description": "Kimi K3 EP32 local expert and top-k geometry",
+    },
+    "k3_ep32_one_received_token_padded": {
+        "seed": 43,
+        "e": 28,
+        "m": 32,
+        "n": 3072,
+        "k": 3584,
+        "top_k": 16,
+        "tune_max_num_tokens": 32,
+        "deepep_sparse_local_ids": True,
+        "deepep_num_valid_rows": 1,
+        "raw_scale": (118, 122),
+        "torch_ref_tolerance": (5e-2, 1e-3),
+        "torch_ref_max_bad": 1,
+        "description": "Kimi K3 EP32 one received token in a 32-row carrier",
+    },
+    "k3_situ_seed47": {
+        "seed": 47,
+        "e": 1,
+        "m": 1,
+        "n": 3072,
+        "k": 3584,
+        "top_k": 1,
+        "raw_scale": (118, 122),
+        "torch_ref_tolerance": (5e-2, 1e-3),
+        "torch_ref_max_bad": 4,
+        "activation": "situ",
+        "description": "K3 SiTU(beta=4, linear_beta=25), single routed row",
+    },
+    "k3_situ_seed53": {
+        "seed": 53,
+        "e": 1,
+        "m": 8,
+        "n": 3072,
+        "k": 3584,
+        "top_k": 1,
+        "raw_scale": (118, 122),
+        "torch_ref_tolerance": (5e-2, 1e-3),
+        "torch_ref_max_bad": 4,
+        "activation": "situ",
+        "description": "K3 SiTU(beta=4, linear_beta=25), eight routed rows",
+    },
+    "k3_situ_ep32_seed59": {
+        "seed": 59,
+        "e": 28,
+        "m": 32,
+        "n": 3072,
+        "k": 3584,
+        "top_k": 16,
+        "deepep_sparse_local_ids": True,
+        "tune_max_num_tokens": 32,
+        "raw_scale": (118, 122),
+        "torch_ref_tolerance": (5e-2, 1e-3),
+        "torch_ref_max_bad": 4,
+        "activation": "situ",
+        "description": "K3 SiTU EP32 sparse local routing and top-k16",
     },
 }
+
+
+def _reference_humming_token_fp8(x):
+    """Model online reciprocal-multiply FP32 quantization, not tensor division.
+
+    The production CUDA helper is compiled with -use_fast_math. Scalar/tensor
+    division uses reciprocal-multiply in PyTorch and matched the independent
+    CUDA quantization probe; tensor/tensor division may cross FP8 midpoints.
+    This is an independent numerical reference, not a production quantizer.
+    """
+    xf = x.to(torch.float32)
+    amax = xf.abs().amax(dim=1, keepdim=True)
+    minimum = 448.0 / torch.finfo(torch.float32).max
+    quant = torch.where(amax > 0, 448.0 / amax.clamp_min(minimum), 1.0)
+    return (xf * quant).to(torch.float8_e4m3fn), 1.0 / quant
 
 
 def _assert_close_with_error_stats(
@@ -3021,6 +3133,8 @@ def _assert_close_with_error_stats(
 ) -> None:
     actual_f = actual.to(torch.float32)
     expected_f = expected.to(torch.float32)
+    assert torch.isfinite(actual_f).all().item(), f"{label}: nonfinite actual"
+    assert torch.isfinite(expected_f).all().item(), f"{label}: nonfinite reference"
     abs_error = (actual_f - expected_f).abs()
     allowed = atol + rtol * expected_f.abs()
     bad = abs_error > allowed
@@ -3271,7 +3385,17 @@ def test_moe_bf16_mxfp4_hopper_activations(
 def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     case_name, case, use_autotune, input_mode
 ):
-    if input_mode == "prequantized" and case_name not in ("small", "k3_profile"):
+    if input_mode == "prequantized" and case_name not in (
+        "small",
+        "k3_profile",
+        "large_k_profile",
+        "k3_single_token_profile",
+        "k3_ep32_single_token_profile",
+        "k3_ep32_one_received_token_padded",
+        "k3_situ_seed47",
+        "k3_situ_seed53",
+        "k3_situ_ep32_seed59",
+    ):
         pytest.skip("focused small and K3-shape cases cover prequantized Humming input")
     if use_autotune and case.get("skip_autotune", False):
         pytest.skip(
@@ -3398,8 +3522,26 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     router_logits = torch.randn(m, e, dtype=output_dtype, device=device)
     routing_weights, selected_local_experts = compute_routing(router_logits, top_k)
     selected_experts = selected_local_experts + start_expert
-    assert int(selected_experts.min().item()) >= start_expert
-    assert int(selected_experts.max().item()) < end_expert
+    if case.get("deepep_sparse_local_ids", False):
+        # DeepEP normal keeps one token row and marks top-k slots owned by
+        # other EP ranks as -1; their combine weights are zero.
+        selected_experts[:, 1:] = -1
+        routing_weights[:, 1:] = 0
+        num_valid_rows = case.get("deepep_num_valid_rows")
+        if num_valid_rows is not None:
+            selected_experts[num_valid_rows:] = -1
+            routing_weights[num_valid_rows:] = 0
+            selected_experts[num_valid_rows:, 0] = (
+                torch.arange(
+                    m - num_valid_rows,
+                    dtype=selected_experts.dtype,
+                    device=selected_experts.device,
+                )
+                % e
+            ) + start_expert
+    valid_selected_experts = selected_experts[selected_experts >= 0]
+    assert int(valid_selected_experts.min().item()) >= start_expert
+    assert int(valid_selected_experts.max().item()) < end_expert
     if ep_rank > 0:
         assert int(selected_experts.min().item()) >= e
     # Humming keeps the FP4->FP8 exponent-bias compensation in the epilogue for
@@ -3437,6 +3579,27 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
         )
         x_runtime = (x.to(torch.float32) * input_quant).to(torch.float8_e4m3fn)
         input_sf = (1.0 / input_quant).contiguous()
+        offset_bytes = case.get("input_sf_storage_offset_bytes", 0)
+        if offset_bytes:
+            assert offset_bytes % input_sf.element_size() == 0
+            offset_elems = offset_bytes // input_sf.element_size()
+            input_sf_backing = torch.empty(
+                offset_elems + input_sf.numel(),
+                dtype=input_sf.dtype,
+                device=input_sf.device,
+            )
+            offset_view = input_sf_backing[offset_elems:].view_as(input_sf)
+            offset_view.copy_(input_sf)
+            input_sf = offset_view
+            assert input_sf.storage_offset() == offset_elems
+
+    activation_kwargs = {}
+    if case.get("activation") == "situ":
+        activation_kwargs = {
+            "activation_type": ActivationType.Situ,
+            "situ_beta": torch.full((e,), 4.0, device=device),
+            "situ_linear_beta": torch.full((e,), 25.0, device=device),
+        }
 
     def run_flash(profile_ids=None):
         flash_output = torch.zeros(m, k, device=device, dtype=output_dtype)
@@ -3453,8 +3616,12 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
             use_wfp4afp8_humming=True,
             ep_size=ep_size,
             ep_rank=ep_rank,
+            tune_max_num_tokens=case.get(
+                "tune_max_num_tokens", max(x.shape[0], 256)
+            ),
             output=flash_output,
             profile_ids=profile_ids,
+            **activation_kwargs,
         )
         return flash_output
 
@@ -3470,32 +3637,37 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
             continue
         batch_idx, nth_expert = torch.where(mask)
         w3_expert, w1_expert = torch.chunk(w1_ref[local_expert_id], 2, dim=0)
-        x_rows = x_ref[batch_idx]
-        fc1_amax = x_rows.abs().amax(dim=1)
-        fc1_quant = torch.where(
-            fc1_amax > 0,
-            torch.full_like(fc1_amax, 448.0) / fc1_amax,
-            torch.ones_like(fc1_amax),
-        )
-        x_fp8_tensor = (x_rows * fc1_quant[:, None]).to(torch.float8_e4m3fn)
+        if input_mode == "prequantized":
+            # Consume exactly the caller's payload; do not requantize BF16.
+            x_fp8_tensor = x_runtime[batch_idx]
+            fc1_dequant = input_sf[batch_idx]
+        else:
+            x_fp8_tensor, fc1_dequant = _reference_humming_token_fp8(x_ref[batch_idx])
         x_fp8 = x_fp8_tensor.to(torch.float32)
-        route_fc1_scale = (1.0 / fc1_quant) * fc1_residual_expert_scale[local_expert_id]
+        route_fc1_scale = fc1_dequant * fc1_residual_expert_scale[local_expert_id]
         # FC1 token scale is applied in the GEMM epilogue before activation, so
         # both gated branches must be scaled before the SiLU/product.
-        fc1_w1 = (x_fp8 @ w1_expert.t()) * route_fc1_scale[:, None]
-        fc1_w3 = (x_fp8 @ w3_expert.t()) * route_fc1_scale[:, None]
-        fc1 = F.silu(fc1_w1) * fc1_w3
-
-        fc2_amax = fc1.abs().amax(dim=1)
-        fc2_quant = torch.where(
-            fc2_amax > 0,
-            torch.full_like(fc2_amax, 448.0) / fc2_amax,
-            torch.ones_like(fc2_amax),
+        fc1_w1 = (
+            ((x_fp8 @ w1_expert.t()) * route_fc1_scale).to(output_dtype).float()
         )
-        fc1_fp8_tensor = (fc1 * fc2_quant[:, None]).to(torch.float8_e4m3fn)
+        fc1_w3 = (
+            ((x_fp8 @ w3_expert.t()) * route_fc1_scale).to(output_dtype).float()
+        )
+        if case.get("activation") == "situ":
+            fc1 = (4.0 * torch.tanh(fc1_w1 / 4.0) * torch.sigmoid(fc1_w1)) * (
+                25.0 * torch.tanh(fc1_w3 / 25.0)
+            )
+        else:
+            fc1 = F.silu(fc1_w1) * fc1_w3
+
+        fc1_fp8_tensor, fc2_dequant = _reference_humming_token_fp8(fc1)
         fc1_fp8 = fc1_fp8_tensor.to(torch.float32)
-        route_fc2_scale = (1.0 / fc2_quant) * fc2_residual_expert_scale[local_expert_id]
-        fc2 = (fc1_fp8 @ w2_ref[local_expert_id].t()) * route_fc2_scale[:, None]
+        route_fc2_scale = fc2_dequant * fc2_residual_expert_scale[local_expert_id]
+        fc2 = (
+            ((fc1_fp8 @ w2_ref[local_expert_id].t()) * route_fc2_scale)
+            .to(output_dtype)
+            .float()
+        )
         ref_output[batch_idx] += routing_weights[batch_idx, nth_expert, None] * fc2
 
     torch_ref_rtol, torch_ref_atol = case["torch_ref_tolerance"]
